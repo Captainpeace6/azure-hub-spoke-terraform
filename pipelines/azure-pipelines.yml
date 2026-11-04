@@ -1,0 +1,119 @@
+# Azure DevOps pipeline: validate -> plan -> (approval) -> apply the exact saved plan.
+#
+# Setup:
+#   - Service connection "azure-hub-spoke-wif" using Workload Identity Federation (no secrets)
+#   - Variable group "tf-state" with TF_STATE_RG, TF_STATE_ACCOUNT, TF_STATE_CONTAINER
+#   - Environment "hub-spoke-prod" with required approvers
+
+trigger:
+  branches:
+    include: [main]
+
+pr:
+  branches:
+    include: [main]
+
+variables:
+  - group: tf-state
+  - name: tfVersion
+    value: 1.10.5
+  - name: workDir
+    value: $(System.DefaultWorkingDirectory)/live
+
+pool:
+  vmImage: ubuntu-latest
+
+stages:
+  - stage: Validate
+    jobs:
+      - job: validate
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(tfVersion)
+          - script: terraform fmt -check -recursive
+            displayName: terraform fmt
+          - script: |
+              terraform init -backend=false -input=false
+              terraform validate
+            workingDirectory: $(workDir)
+            displayName: terraform validate
+          - script: |
+              pip install checkov
+              checkov -d . --framework terraform --compact --quiet
+            displayName: checkov
+
+  - stage: Plan
+    dependsOn: Validate
+    jobs:
+      - job: plan
+        steps:
+          - task: TerraformInstaller@1
+            inputs:
+              terraformVersion: $(tfVersion)
+          - task: AzureCLI@2
+            displayName: terraform plan
+            inputs:
+              azureSubscription: azure-hub-spoke-wif
+              addSpnToEnvironment: true
+              scriptType: bash
+              scriptLocation: inlineScript
+              workingDirectory: $(workDir)
+              inlineScript: |
+                set -euo pipefail
+                export ARM_CLIENT_ID="$servicePrincipalId"
+                export ARM_TENANT_ID="$tenantId"
+                export ARM_OIDC_TOKEN="$idToken"
+                export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                export ARM_USE_OIDC=true
+                terraform init -input=false \
+                  -backend-config="resource_group_name=$(TF_STATE_RG)" \
+                  -backend-config="storage_account_name=$(TF_STATE_ACCOUNT)" \
+                  -backend-config="container_name=$(TF_STATE_CONTAINER)" \
+                  -backend-config="key=hub-spoke.tfstate"
+                terraform plan -input=false -out=tfplan
+                terraform show -no-color tfplan > plan.txt
+          # Publish the binary plan so Apply runs exactly what was reviewed
+          # (no drift between review and execution).
+          - publish: $(workDir)/tfplan
+            artifact: tfplan
+          - publish: $(workDir)/plan.txt
+            artifact: plan-text
+
+  - stage: Apply
+    dependsOn: Plan
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: apply
+        environment: hub-spoke-prod   # approval gate lives on this environment
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - checkout: self
+                - download: current
+                  artifact: tfplan
+                - task: TerraformInstaller@1
+                  inputs:
+                    terraformVersion: $(tfVersion)
+                - task: AzureCLI@2
+                  displayName: terraform apply (saved plan)
+                  inputs:
+                    azureSubscription: azure-hub-spoke-wif
+                    addSpnToEnvironment: true
+                    scriptType: bash
+                    scriptLocation: inlineScript
+                    workingDirectory: $(workDir)
+                    inlineScript: |
+                      set -euo pipefail
+                      export ARM_CLIENT_ID="$servicePrincipalId"
+                      export ARM_TENANT_ID="$tenantId"
+                      export ARM_OIDC_TOKEN="$idToken"
+                      export ARM_SUBSCRIPTION_ID="$(az account show --query id -o tsv)"
+                      export ARM_USE_OIDC=true
+                      terraform init -input=false \
+                        -backend-config="resource_group_name=$(TF_STATE_RG)" \
+                        -backend-config="storage_account_name=$(TF_STATE_ACCOUNT)" \
+                        -backend-config="container_name=$(TF_STATE_CONTAINER)" \
+                        -backend-config="key=hub-spoke.tfstate"
+                      terraform apply -input=false "$(Pipeline.Workspace)/tfplan/tfplan"

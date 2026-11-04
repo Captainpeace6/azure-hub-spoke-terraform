@@ -1,0 +1,53 @@
+name: terraform-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  fmt-validate:
+    name: Format & validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.10.5
+      - run: terraform fmt -check -recursive -diff
+      - name: Validate
+        working-directory: live
+        run: |
+          terraform init -backend=false -input=false
+          terraform validate -no-color
+
+  tflint:
+    name: TFLint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: terraform-linters/setup-tflint@v4
+        with:
+          tflint_version: v0.53.0
+      - run: tflint --init --config "$GITHUB_WORKSPACE/.tflint.hcl"
+      - run: |
+          set -e
+          for dir in modules/* live; do
+            echo "::group::$dir"
+            tflint --chdir="$dir" --config "$GITHUB_WORKSPACE/.tflint.hcl" --format compact
+            echo "::endgroup::"
+          done
+
+  checkov:
+    name: Security scan (Checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install checkov
+      - run: checkov -d . --framework terraform --compact --quiet
